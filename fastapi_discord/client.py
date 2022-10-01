@@ -1,13 +1,14 @@
+import asyncio
 from typing import Dict, List, Optional, Tuple, Union
 
 import aiohttp
 from aiocache import cached
 from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from typing_extensions import TypedDict, Literal
+from typing_extensions import Literal, TypedDict
 
 from .config import DISCORD_API_URL, DISCORD_OAUTH_AUTHENTICATION_URL, DISCORD_TOKEN_URL
-from .exceptions import RateLimited, ScopeMissing, Unauthorized, InvalidToken
+from .exceptions import InvalidToken, RateLimited, ScopeMissing, Unauthorized
 from .models import Guild, GuildPreview, User
 
 
@@ -98,11 +99,7 @@ class DiscordOAuthClient:
         self.client_session: aiohttp.ClientSession = aiohttp.ClientSession()
 
     def get_oauth_login_url(self, state: Optional[str] = None):
-        """
-
-        Returns a Discord Login URL
-
-        """
+        """Returns a Discord Login URL"""
         client_id = f"client_id={self.client_id}"
         redirect_uri = f"redirect_uri={self.redirect_uri}"
         scopes = f"scope={self.scopes}"
@@ -113,33 +110,47 @@ class DiscordOAuthClient:
     oauth_login_url = property(get_oauth_login_url)
 
     @cached(ttl=550)
-    async def request(self, route: str, token: str = None, method: Literal["GET", "POST"] = "GET"):
+    async def request(
+        self,
+        route: str,
+        token: Optional[str] = None,
+        method: Literal["GET", "POST"] = "GET",
+    ):
+        if method not in ("GET", "POST"):
+            raise Exception("Other HTTP than GET and POST are currently not Supported")
+
         headers: Dict = {}
         if token:
             headers = {"Authorization": f"Bearer {token}"}
-        if method == "GET":
-            async with self.client_session.get(
-                f"{DISCORD_API_URL}{route}",
-                headers=headers,
-                proxy=self.proxy,
-                proxy_auth=self.proxy_auth,
-            ) as resp:
-                data = await resp.json()
-        elif method == "POST":
-            async with self.client_session.post(
-                f"{DISCORD_API_URL}{route}",
-                headers=headers,
-                proxy=self.proxy,
-                proxy_auth=self.proxy_auth,
-            ) as resp:
-                data = await resp.json()
-        else:
-            raise Exception("Other HTTP than GET and POST are currently not Supported")
-        if resp.status == 401:
-            raise Unauthorized
-        if resp.status == 429:
-            raise RateLimited(data, resp.headers)
-        return data
+
+        for try_ in range(1, 10000):
+            try:
+                if method == "GET":
+                    async with self.client_session.get(
+                        f"{DISCORD_API_URL}{route}",
+                        headers=headers,
+                        proxy=self.proxy,
+                        proxy_auth=self.proxy_auth,
+                    ) as resp:
+                        data = await resp.json()
+                else:
+                    async with self.client_session.post(
+                        f"{DISCORD_API_URL}{route}",
+                        headers=headers,
+                        proxy=self.proxy,
+                        proxy_auth=self.proxy_auth,
+                    ) as resp:
+                        data = await resp.json()
+
+                if resp.status == 401:
+                    raise Unauthorized
+
+                if resp.status == 429:
+                    raise RateLimited(data, resp.headers)
+
+                return data
+            except aiohttp.ClientOSError:
+                await asyncio.sleep(try_ * 0.5)
 
     async def get_token_response(self, payload: PAYLOAD) -> TokenResponse:
         async with self.client_session.post(
@@ -169,11 +180,13 @@ class DiscordOAuthClient:
             "refresh_token": refresh_token,
         }
         resp = await self.get_token_response(payload)
+
         return _tokens(resp)
 
     async def user(self, request: Request):
         if "identify" not in self.scopes:
             raise ScopeMissing("identify")
+
         route = "/users/@me"
         token = self.get_token(request)
         return User(**(await self.request(route, token)))
@@ -204,7 +217,9 @@ class DiscordOAuthClient:
         except Unauthorized:
             return False
 
-    async def requires_authorization(self, bearer: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer())):
+    async def requires_authorization(
+        self, bearer: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer())
+    ):
         if bearer is None:
             raise Unauthorized
         if not await self.isAuthenticated(bearer.credentials):
